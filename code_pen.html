@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Chord Player + MIDI Export (Half‑Dim & Tensions)</title>
+<style>
+  body { font-family: system-ui, -apple-system, "Segoe UI", Inter, Arial; background:#f3f4f6; }
+  .wrap { max-width: 860px; margin: 24px auto; background:#fff; padding:24px; border-radius:16px; box-shadow:0 10px 30px rgba(0,0,0,.06); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  textarea, input { padding:.5rem .65rem; border:1px solid #d1d5db; border-radius:10px; }
+  .btn { padding:.6rem 1rem; border:none; border-radius:999px; font-weight:700; cursor:pointer; }
+  .btn:disabled { opacity:.6; cursor:not-allowed; }
+  .btn-blue { background:#2563eb; color:#fff; }
+  .btn-red { background:#dc2626; color:#fff; }
+  .btn-green { background:#16a34a; color:#fff; }
+  .btn-gray { background:#e5e7eb; color:#111827; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(90px,1fr)); gap:8px; margin-top:12px; }
+  .cell { border:2px solid #e5e7eb; border-radius:10px; padding:.6rem; text-align:center; font-weight:700; color:#111827; }
+  .cell.active { background:#3b82f6; color:#fff; border-color:#1d4ed8; box-shadow:0 6px 20px rgba(29,78,216,.35); }
+  #msg { margin-top:10px; text-align:center; color:#374151; min-height:1.2em; }
+  .small { font-size:.85rem; color:#6b7280; }
+  /* timeline visualization */
+  .timeline { position:relative; height:56px; border:2px solid #e5e7eb; border-radius:12px; overflow:hidden; margin-top:10px; background:#f9fafb; }
+  .tl-track { position: absolute; inset: 0; display:flex; }
+  .tl-chord { flex: 1 0 auto; display:flex; align-items:center; justify-content:center; font-weight:700; color:#374151; border-right:2px solid #fff; background:#e5e7eb; }
+  .tl-chord:last-child { border-right:none; }
+  .tl-chord.active { background:#3b82f6; color:#fff; }
+  .playhead { position:absolute; top:0; bottom:0; width:2px; background:#ef4444; box-shadow:0 0 0 1px rgba(239,68,68,.2); transform:translateX(0); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>เครื่องมือสร้างและเล่นคอร์ด (รองรับ 7/9/11/13, #/b และ m7b5/ø7)</h1>
+
+  <label class="small">คอร์ดของคุณ (คั่นด้วยช่องว่าง; ขีด - จะถูกละเว้นอัตโนมัติ)</label>
+  <textarea id="chords" rows="2" style="width:100%;">Dm7 G7 Cmaj7 A7 Dm7 G7 Em7b5</textarea>
+
+  <div class="row" style="margin-top:10px;">
+    <label>BPM <input id="bpm" type="number" value="90" min="30" max="240" style="width:80px;"></label>
+    <label>Bars / chord <input id="bars" type="number" value="1" min="1" max="8" style="width:80px;"></label>
+    <label>Time Sig
+      <input id="numer" type="number" value="4" min="1" max="12" style="width:64px;"> /
+      <input id="denom" type="number" value="4" min="1" max="8" style="width:64px;">
+    </label>
+  </div>
+
+  <div class="row" style="margin-top:10px;">
+    <button id="play" class="btn btn-blue">▶ เล่น</button>
+    <button id="stop" class="btn btn-red" disabled>⏹ หยุด</button>
+    <button id="export" class="btn btn-green">⬇ Export MIDI</button>
+    <button id="metro" class="btn btn-gray">🧭 Metronome: Off</button>
+    <button id="tests" class="btn btn-gray" title="Run built-in tests">🧪 Run tests</button>
+  </div>
+
+  <div id="display" class="grid"></div>
+  <div id="timeline" class="timeline" aria-label="Chord timeline"></div>
+  <div id="msg"></div>
+  <div class="small" style="margin-top:6px;">
+    ตัวอย่างที่รองรับ: Cmaj7, D7, Dm7, G9, A7b9, Cmaj9, Dm9, G13, C6, add9, sus2/sus4, dim, aug(+), <b>Em7b5 / Eø7</b>
+  </div>
+</div>
+
+<script>
+/* =================== Utilities & UI =================== */
+const $ = id => document.getElementById(id);
+const ctx = new (window.AudioContext || window.webkitAudioContext)();
+function showMsg(t){ $("msg").textContent = t || ""; }
+
+/* =================== Parser: Extended Chords (+ half-diminished) =================== */
+/** Features:
+ * Root: A..G with #/b
+ * Base qualities: (default major triad), m, maj, dim, aug(+), sus2, sus4, m7b5, ø7, ø
+ * Sevenths: maj7, m7, 7
+ * Shorthands with tensions: 9 / 11 / 13 (dominant by default)
+ * Tensions/alterations: add9, 6, m6, (b9/#9/9), (11/#11), (b13/13)
+ */
+const NOTE_TO_SEMITONE = {C:0,"C#":1,Db:1,D:2,"D#":3,Eb:3,E:4,F:5,"F#":6,Gb:6,G:7,"G#":8,Ab:8,A:9,"A#":10,Bb:10,B:11};
+
+// triads and special bases
+const BASE_TRIADS = {
+  "maj": [0,4,7],
+  "": [0,4,7],          // default
+  "m": [0,3,7],
+  "dim": [0,3,6],
+  "aug": [0,4,8],
+  "+": [0,4,8],
+  "sus2": [0,2,7],
+  "sus4": [0,5,7],
+  // half-diminished base will be handled as special case [0,3,6,10]
+};
+
+const SEVENTHS = {
+  "maj7": 11,
+  "m7": 10,
+  "7": 10
+};
+
+// tension map (semitones from root)
+const TENSIONS = {
+  "b9":13, "♭9":13, "9":14, "#9":15, "♯9":15,
+  "11":17, "#11":18, "♯11":18,
+  "b13":20, "♭13":20, "13":21
+};
+
+// regex: include m7b5 and ø7 (and ø without 7 = treat as ø7)
+const CHORD_RE = new RegExp(
+  "^" +
+  "([A-G](?:#|b)?)" +                                // 1 root
+  "(?:" +
+    "(m7b5|ø7|ø|maj7|m7|7|maj|m|dim|aug|[+]|sus2|sus4)?" + // 2 primary quality (with m7b5/ø7)
+    "(maj7|m7|7)?" +                                 // 3 optional explicit seventh
+  ")?" +
+  "((?:add9|madd9|maj9|m9|9|11|13|6|m6)?)" +         // 4 shorthand/ext
+  "((?:b9|#9|9|11|#11|b13|13)*)" +                   // 5 extra tensions
+  "$","i"
+);
+
+// split extra tensions like 'b9#11' -> ['b9','#11']
+function splitTensions(s){
+  const r = [];
+  const re = /(b9|#9|9|11|#11|b13|13)/gi;
+  let m;
+  while((m=re.exec(s))){ r.push(m[1]); }
+  return r;
+}
+
+function sanitizeInput(s){
+  // normalize: replace unicode flats/sharps to ascii, hyphens to spaces, collapse spaces
+  return s
+    .replace(/♭/g, "b").replace(/♯/g, "#").replace(/ø/g, "ø")
+    .replace(/[-–—]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Build interval set (in semitones) from parsed groups
+function buildIntervals(baseQual, explicit7th, shorthand, extras){
+  const set = new Set();
+
+  // half-diminished special base
+  const isHalfDimBase = /^(m7b5|ø7|ø)$/i.test(baseQual);
+
+  if (isHalfDimBase) {
+    [0,3,6,10].forEach(x=>set.add(x)); // 1 b3 b5 b7
+  } else {
+    const triad = BASE_TRIADS[baseQual] || BASE_TRIADS[""];
+    triad.forEach(x=>set.add(x));
+  }
+
+  // shorthand extensions & adds
+  if (/^m6$/i.test(shorthand)) { set.clear(); BASE_TRIADS["m"].forEach(x=>set.add(x)); set.add(9); }     // m + 6
+  else if (/^6$/i.test(shorthand)) { set.add(9); }                                                       // +6
+  if (/^madd9$/i.test(shorthand)) { set.clear(); BASE_TRIADS["m"].forEach(x=>set.add(x)); set.add(14); } // m triad + 9
+  else if (/^add9$/i.test(shorthand)) { set.add(14); }                                                   // +9
+  if (/^maj9$/i.test(shorthand)) { set.clear(); BASE_TRIADS["maj"].forEach(x=>set.add(x)); set.add(11); set.add(14); }
+  if (/^m9$/i.test(shorthand))   { set.clear(); BASE_TRIADS["m"].forEach(x=>set.add(x)); set.add(10); set.add(14); }
+  if (/^9$/i.test(shorthand))    { set.add(10); set.add(14); } // dominant 9
+  if (/^11$/i.test(shorthand))   { set.add(10); set.add(17); } // dominant 11
+  if (/^13$/i.test(shorthand))   { set.add(10); set.add(21); } // dominant 13
+
+  // explicit seventh (skip if half-dim already has b7)
+  if (explicit7th && !isHalfDimBase) set.add(SEVENTHS[explicit7th]);
+
+  // extras: b9/#9/9/11/#11/b13/13
+  extras.forEach(t=>{
+    const key = t.replace("♭","b").replace("♯","#");
+    const val = TENSIONS[key];
+    if (val!=null) set.add(val);
+  });
+
+  return Array.from(set).sort((a,b)=>a-b);
+}
+
+// Convert chord token -> midi notes
+function chordTokenToMidiNotes(token){
+  const m = token.match(CHORD_RE);
+  if (!m) return null;
+  let [, rootRaw, qualA="", qualB="", shorthand="", extraStr=""] = m;
+
+  // normalize base quality
+  let baseQual = (qualA||"").toLowerCase();
+  if (baseQual === "maj") baseQual = ""; // plain major
+
+  // If base is ø (without 7), treat as ø7
+  if (baseQual === "ø") baseQual = "ø7";
+
+  // Determine explicit seventh (if any)
+  let explicit7th = "";
+  if (qualB && /^(maj7|m7|7)$/i.test(qualB)) {
+    explicit7th = qualB.toLowerCase();
+  } else if (qualA && /^(maj7|m7|7)$/i.test(qualA) && !/^(m7b5|ø7|ø)$/i.test(qualA)) {
+    // if qualA is just a seventh label (not the half-dim base)
+    explicit7th = qualA.toLowerCase();
+    baseQual = ""; // default triad major if only a seventh given
+  }
+
+  shorthand = (shorthand||"").toLowerCase();
+  const extras = splitTensions(extraStr);
+
+  const rootName = rootRaw[0].toUpperCase() + (rootRaw[1]||"");
+  if (!(rootName in NOTE_TO_SEMITONE)) return null;
+
+  const intervals = buildIntervals(baseQual, explicit7th, shorthand, extras);
+
+  // Root around C4 = 60
+  const rootMidi = 60 + NOTE_TO_SEMITONE[rootName];
+
+  // Map intervals to midi; simple voicing: add bass (root-12), fold very high notes down an octave
+  const notes = intervals.map(semi => rootMidi + semi);
+  notes.unshift(rootMidi - 12); // bass
+  return notes.map(n => (n > 76 ? n - 12 : n)); // compact voicing
+}
+
+function midiToFreq(m){ return 440 * Math.pow(2, (m-69)/12); }
+
+/* =================== Audio Engine (Web Audio) =================== */
+let playing = false, chordIndex = 0, metroOn = false, metroTimer = null;
+
+function playTone(freq, dur=0.18, vol=0.25){
+  const now = ctx.currentTime;
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = 'sine';
+  osc.frequency.value = freq;
+  gain.gain.setValueAtTime(0, now);
+  gain.gain.linearRampToValueAtTime(vol, now + 0.002);
+  gain.gain.exponentialRampToValueAtTime(0.0005, now + dur);
+  osc.connect(gain).connect(ctx.destination);
+  osc.start(now);
+  osc.stop(now + dur + 0.02);
+}
+
+function playChordFreqs(freqs, durSec){
+  freqs.forEach(f => playTone(f, Math.min(durSec*0.95, 2.5), 0.18));
+}
+
+function startMetronome(secPerBeat, numer){
+  stopMetronome();
+  let beat = 0;
+  metroTimer = setInterval(()=>{
+    const accent = (beat % numer)===0;
+    playTone(accent ? 1500 : 1000, 0.05, accent ? 0.5 : 0.3);
+    beat++;
+  }, secPerBeat*1000);
+}
+function stopMetronome(){
+  if (metroTimer){ clearInterval(metroTimer); metroTimer = null; }
+}
+
+/* =================== MIDI Writer (Format 0) =================== */
+function saveBytesAsFile(bytes, filename){
+  const blob = new Blob([bytes], {type: 'audio/midi'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(()=>URL.revokeObjectURL(url), 1000); // allow download to start
+}
+
+function exportMIDIFile(tokens, cfg){
+  const parsed = tokens.map(ch => chordTokenToMidiNotes(ch));
+  if (parsed.some(v => !v)) throw new Error("มีคอร์ดที่แปลงไม่ได้");
+
+  const ppq = 480;
+  const ticksPerBeat = ppq;
+  const ticksPerBar = ticksPerBeat * cfg.numer;
+  const chordTicks = ticksPerBar * cfg.bars;
+
+  const track = [];
+  // tempo meta
+  const mpqn = Math.round(60000000 / cfg.bpm);
+  track.push(0x00, 0xFF, 0x51, 0x03, (mpqn>>16)&0xFF, (mpqn>>8)&0xFF, mpqn&0xFF);
+  // time signature meta (denom as power of 2)
+  const denomPow = Math.round(Math.log2(cfg.denom));
+  track.push(0x00, 0xFF, 0x58, 0x04, cfg.numer & 0xFF, denomPow & 0xFF, 24, 8);
+
+  function deltaVar(v){ const b=[]; let x=v; do{ let c=x&0x7F; x>>=7; if(x>0) c|=0x80; b.unshift(c);}while(x>0); return b; }
+  function on(n, v=90){ return [0x90, n, v]; }
+  function off(n){ return [0x80, n, 64]; }
+
+  for(const chord of parsed){
+    for(const n of chord){ track.push(...deltaVar(0), ...on(n)); }
+    for(const n of chord){ track.push(...deltaVar(chordTicks), ...off(n)); }
+  }
+  track.push(0x00, 0xFF, 0x2F, 0x00); // end
+
+  function strB(s){ return Array.from(s).map(c=>c.charCodeAt(0)); }
+  const header = [...strB("MThd"), 0,0,0,6, 0,0, 0,1, (ppq>>8)&0xFF, ppq&0xFF];
+  const len = track.length;
+  const trk = [...strB("MTrk"), (len>>>24)&255, (len>>>16)&255, (len>>>8)&255, len&255, ...track];
+  return new Uint8Array([...header, ...trk]);
+}
+
+/* =================== Playback control =================== */
+function getCfg(){
+  return {
+    bpm: Math.max(30, Math.min(240, +$("bpm").value||90)),
+    bars: Math.max(1, Math.min(8, +$("bars").value||1)),
+    numer: Math.max(1, Math.min(12, +$("numer").value||4)),
+    denom: [1,2,4,8].includes(+$("denom").value) ? +$("denom").value : 4
+  };
+}
+
+function renderCells(tokens){
+  $("display").innerHTML = tokens.map(t => `<div class="cell">${t}</div>`).join("");
+}
+
+function renderTimeline(tokens){
+  const el = $("timeline");
+  if (!el) return;
+  const track = document.createElement('div');
+  track.className = 'tl-track';
+  track.style.width = '100%';
+  tokens.forEach(t => {
+    const c = document.createElement('div');
+    c.className = 'tl-chord';
+    c.textContent = t;
+    track.appendChild(c);
+  });
+  const ph = document.createElement('div');
+  ph.className = 'playhead';
+  el.innerHTML = '';
+  el.appendChild(track);
+  el.appendChild(ph);
+}
+
+function playSequence(){
+  const tokens = sanitizeInput($("chords").value).split(/\s+/).filter(Boolean);
+  if (tokens.length===0) return showMsg("กรุณาใส่คอร์ดก่อน");
+  renderCells(tokens);
+  renderTimeline(tokens);
+
+  const parsed = tokens.map(ch => chordTokenToMidiNotes(ch));
+  if (parsed.some(v => !v)){
+    const badAt = parsed.findIndex(v=>!v);
+    return showMsg(`ไม่รู้จักคอร์ด: ${tokens[badAt]}`);
+  }
+
+  const cfg = getCfg();
+  const secPerBeat = 60 / cfg.bpm;
+  const secPerBar = secPerBeat * cfg.numer;
+  const chordDur = secPerBar * cfg.bars;
+
+  const cells = Array.from(document.querySelectorAll(".cell"));
+  chordIndex = 0;
+  playing = true;
+  $("play").disabled = true;
+  $("stop").disabled = false;
+  showMsg("กำลังเล่นคอร์ด...");
+
+  if (metroOn) startMetronome(secPerBeat, cfg.numer);
+
+  (async ()=>{ await ctx.resume(); step(); })();
+
+  function step(){
+    if (!playing) return;
+    cells.forEach(c=>c.classList.remove("active"));
+    cells[chordIndex]?.classList.add("active");
+
+    const freqs = parsed[chordIndex].map(midiToFreq);
+    playChordFreqs(freqs, chordDur);
+
+    // animate timeline playhead within each chord block
+    const tl = $("timeline");
+    const ph = tl?.querySelector('.playhead');
+    const blocks = tl ? Array.from(tl.querySelectorAll('.tl-chord')) : [];
+    const total = parsed.length;
+    const tlWidth = tl?.clientWidth || 0;
+    const blockWidth = total ? tlWidth / total : 0;
+    if (ph && tlWidth>0){
+      const startX = Math.floor(blockWidth * chordIndex);
+      const endX = Math.floor(blockWidth * (chordIndex+1));
+      const startTime = performance.now();
+      const durationMs = chordDur * 1000;
+      // highlight active block
+      blocks.forEach(b=>b.classList.remove('active'));
+      if (blocks[chordIndex]) blocks[chordIndex].classList.add('active');
+      function animate(){
+        if (!playing) return;
+        const p = Math.min(1, (performance.now()-startTime)/durationMs);
+        const x = startX + (endX - startX) * p;
+        ph.style.transform = `translateX(${x}px)`;
+        if (p < 1) requestAnimationFrame(animate);
+      }
+      requestAnimationFrame(animate);
+    }
+
+    chordIndex++;
+    if (chordIndex < parsed.length){
+      setTimeout(step, chordDur*1000);
+    } else {
+      stopAll();
+      showMsg("เล่นจบแล้ว");
+    }
+  }
+}
+
+function stopAll(){
+  playing = false;
+  $("play").disabled = false;
+  $("stop").disabled = true;
+  stopMetronome();
+  Array.from(document.querySelectorAll(".cell")).forEach(c=>c.classList.remove("active"));
+  const tl = $("timeline");
+  if (tl){
+    tl.querySelectorAll('.tl-chord').forEach(b=>b.classList.remove('active'));
+    const ph = tl.querySelector('.playhead');
+    if (ph) ph.style.transform = 'translateX(0)';
+  }
+}
+
+/* =================== Tests =================== */
+function runTests(){
+  const cases = [
+    "Dm7 G7 Cmaj7 A7 Dm7 G7 Em7b5",          // ผู้ใช้รายงาน
+    "Eø7 A7 Dm7 G7 Cmaj7",                    // ø7 alias
+    "Cmaj7 - D7 - Dm7 - G9 - Cmaj7 - A7b9 - Dm7 - G9", // เดิม
+    "Cmaj9 Dm9 G13 C6",
+    "Cadd9 Cmadd9 Caug Cdim Csus2 Csus4",
+    "F#7b9 B9 Emaj7 A13",
+  ];
+  let pass = 0, fail = 0, details = [];
+  for(const line of cases){
+    const tokens = sanitizeInput(line).split(/\s+/).filter(Boolean);
+    const parsed = tokens.map(ch => chordTokenToMidiNotes(ch));
+    const ok = parsed.every(arr => Array.isArray(arr) && arr.length>=3);
+    if (ok) pass++; else { fail++; details.push(`Fail: ${line} -> ${tokens[parsed.findIndex(v=>!v)]}`); }
+  }
+  showMsg(`Tests: ${pass} passed, ${fail} failed${details.length? " | " + details.join(" ; "):""}`);
+}
+
+/* =================== Bindings =================== */
+$("play").onclick = () => playSequence();
+$("stop").onclick = () => stopAll();
+$("metro").onclick = () => {
+  metroOn = !metroOn;
+  $("metro").textContent = metroOn ? "🧭 Metronome: On" : "🧭 Metronome: Off";
+};
+$("export").onclick = () => {
+  const tokens = sanitizeInput($("chords").value).split(/\s+/).filter(Boolean);
+  try {
+    const bytes = exportMIDIFile(tokens, getCfg());
+    saveBytesAsFile(bytes, "chords.mid");
+    showMsg("ส่งออก MIDI แล้ว");
+  } catch(e){
+    showMsg(e.message || "Export ล้มเหลว");
+  }
+};
+$("tests").onclick = () => runTests();
+
+// Initialize timeline on load and keep in sync with input
+document.addEventListener('DOMContentLoaded', () => {
+  const text = sanitizeInput($("chords").value).split(/\s+/).filter(Boolean);
+  if (text.length) renderTimeline(text);
+});
+$("chords").addEventListener('input', () => {
+  const tokens = sanitizeInput($("chords").value).split(/\s+/).filter(Boolean);
+  renderTimeline(tokens);
+});
+</script>
+</body>
+</html>
