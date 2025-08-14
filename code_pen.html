@@ -454,7 +454,7 @@ $("tests").onclick = () => runTests();
 
 // Initialize timeline on load and keep in sync with input
 document.addEventListener('DOMContentLoaded', () => {
-  const text = sanitizeInput($("chords").value).split(/\s+/).filter(Boolean);
+  const text = sanitizeInput($("chords").value).split(/\s+/).filter(Boolean);echo "# code_pen_by_soundscope" >> README.md
   if (text.length) renderTimeline(text);
 });
 $("chords").addEventListener('input', () => {
